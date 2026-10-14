@@ -29,3 +29,9 @@ def test_local_gitignore_protects_mail_dumps():
     text = (ROOT / ".gitignore").read_text()
     for pattern in (".env", "*.eml", "*.mbox", "*.pem", "*.key"):
         assert pattern in text
+
+
+def test_git_for_windows_forward_slash_roots_are_normalized():
+    updater = (ROOT / "scripts/Apply-HeavenICloudMail.ps1").read_text()
+    assert '[IO.Path]::GetFullPath' in updater
+    assert '[StringComparer]::OrdinalIgnoreCase' in updater

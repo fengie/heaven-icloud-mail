@@ -16,7 +16,10 @@ function Git-Read([string[]]$Arguments) {
     return ($out | Out-String).Trim()
 }
 
-if ((Git-Read -Arguments @('rev-parse','--show-toplevel')) -ne $RepoRoot) { throw 'Repo root mismatch' }
+# Git for Windows may print C:/path while PowerShell resolves C:\path.
+$ObservedRoot = [IO.Path]::GetFullPath((Git-Read -Arguments @('rev-parse','--show-toplevel')))
+$CanonicalRoot = [IO.Path]::GetFullPath($RepoRoot)
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($ObservedRoot, $CanonicalRoot)) { throw 'Repo root mismatch' }
 $origin = Git-Read -Arguments @('remote','get-url','origin')
 if ($origin -notmatch '^(https://github\.com/fengie/heaven-icloud-mail(\.git)?|git@github\.com:fengie/heaven-icloud-mail\.git)$') {
     throw 'Expected canonical GitHub source origin'
