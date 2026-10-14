@@ -1,0 +1,16 @@
+{
+  "schema": "heaven-toolbox/update-policy/v1",
+  "repository": "fengie/heaven-icloud-mail",
+  "branch": "main",
+  "kind": "product",
+  "source_update": {
+    "required": true,
+    "strategy": "ff-only",
+    "poll_interval_minutes": 1,
+    "controller": "heaven-toolbox/repo-autoupdate"
+  },
+  "runtime_update": {
+    "mode": "apply-script",
+    "apply_script": "scripts/Apply-HeavenICloudMail.ps1"
+  }
+}

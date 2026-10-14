@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heaven-icloud-mail"
+version = "0.1.0"
+description = "Privacy-first, read-only iCloud Mail MCP bridge"
+readme = "readme.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary - personal project; no distribution rights granted"}
+dependencies = ["tzdata>=2025.2; platform_system == 'Windows'"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.20,<3"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+heaven-icloud-mail = "heaven_icloud_mail.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
