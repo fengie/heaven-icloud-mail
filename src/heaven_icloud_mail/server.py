@@ -17,15 +17,17 @@ def check_transport(transport: str) -> str:
 
 
 def build_mcp():
-    # SDK is an optional runtime dependency, not needed to run unit tests.
-    try:
-        from mcp.server.mcpserver import MCPServer
-    except ImportError:
-        from mcp.server.fastmcp import FastMCP as MCPServer
+    # MCP v2 has a stable, directly tested protocol API. The runtime package
+    # remains optional for pure unit tests and is exercised in CI separately.
+    from mcp.server import MCPServer
+    from mcp.types import ToolAnnotations
 
     mcp = MCPServer("Heaven iCloud Mail")
 
-    @mcp.tool()
+    @mcp.tool(
+        title="Summarize iCloud Mail (read-only)",
+        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    )
     def summarize_icloud_mail(day: str = "today", limit: int = 15) -> dict[str, object]:
         """Read only the owner's iCloud INBOX for a date; summarize in Simplified Chinese.
 
