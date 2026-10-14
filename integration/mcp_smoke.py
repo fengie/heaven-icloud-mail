@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
-from mcp import Client
+from mcp import Client, StdioServerParameters
 
 from heaven_icloud_mail.server import build_mcp
 
@@ -32,6 +33,19 @@ async def _verify() -> None:
         # Without explicit owner consent and runtime credentials the tool MUST
         # refuse access before any IMAP connection, and the MCP client must get
         # a tool error, not an unhandled transport/protocol crash.
+        result = await client.call_tool("summarize_icloud_mail", {"day": "today", "limit": 1})
+        assert result.is_error is True, result
+
+    # CI also checks the actual executable entry point/stdio protocol, not just
+    # an in-memory server that might hide subprocess or lifecycle defects.
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "heaven_icloud_mail"],
+        env={"ICLOUD_MAIL_ACCOUNT_CONSENT": "no"},
+    )
+    async with Client(params) as client:
+        tools = await client.list_tools()
+        assert [item.name for item in tools.tools] == ["summarize_icloud_mail"]
         result = await client.call_tool("summarize_icloud_mail", {"day": "today", "limit": 1})
         assert result.is_error is True, result
 

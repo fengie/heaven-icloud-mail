@@ -25,13 +25,14 @@ Example normal-language request after ChatGPT integration is actually verified: 
 ## Developer quickstart
 
 ```sh
-python -m pip install -e '.[test]'
+python -m pip install -e '.[test,mcp]'
 python -m pytest -q
 python scripts/security_gate.py
-python -m compileall -q src
+python integration/mcp_smoke.py
+python -m compileall -q src integration
 ```
 
-Install MCP separately with `python -m pip install -e '.[mcp]'` on the authorized host. Current CI tests the independent IMAP parsing and read-only invariants; an actual MCP handshake, live iCloud auth, installed ChatGPT behavior, and Free-plan invocation **remain unverified** until those integrations are available.
+Install MCP separately with `python -m pip install -e '.[mcp]'` on the authorized host. GitHub Actions tests the independent IMAP parser, read-only invariants, and **real MCP v2 tool negotiation/call failures** on Python 3.11 and 3.13 on Windows and Linux. The in-process handshake passed at source SHA `c7f017f` on all four platform combinations; the additional stdio subprocess acceptance test is pending fresh CI at the next commit. Live iCloud auth, installed ChatGPT behavior, and Free-plan invocation **remain unverified**.
 
 ## Ownership and maintenance
 
