@@ -54,11 +54,21 @@ def _flat(value: str, limit: int) -> str:
     return re.sub(r"\s+", " ", "".join(c for c in str(value) if c.isprintable() or c in "\t\n ")).strip()[:limit]
 
 
+def _body_parts(message: email.message.EmailMessage):
+    # walk() descends into attached messages and multipart attachments. Exclude
+    # the complete subtree before examining any of its child text parts.
+    if message.get_content_disposition() == "attachment":
+        return
+    if message.is_multipart():
+        for part in message.iter_parts():
+            yield from _body_parts(part)
+    else:
+        yield message
+
+
 def _text_preview(message: email.message.EmailMessage) -> str:
     html_part = None
-    for part in message.walk():
-        if part.is_multipart() or part.get_content_disposition() == "attachment":
-            continue
+    for part in _body_parts(message):
         if part.get_content_type() not in ("text/plain", "text/html"):
             continue
         try:

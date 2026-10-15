@@ -12,6 +12,25 @@ FORBIDDEN_NAME = {".env", "secrets.json", "credentials.json"}
 # Scan tracked configuration files rather than code or synthetic fixtures.
 CONFIG_EXT = {".yaml", ".yml", ".json", ".toml", ".ini", ".env"}
 SECRET_ASSIGNMENT = re.compile(r"(?im)^\s*(?:ICLOUD_MAIL_APP_PASSWORD|APPLE_ID_PASSWORD|MCP_ACCESS_TOKEN)\s*[:=]\s*['\"]?[^\s'\"#][^\s]*")
+EXAMPLE_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)^[ \t]*(?:export[ \t]+)?(?:ICLOUD_MAIL_USERNAME|ICLOUD_MAIL_APP_PASSWORD|APPLE_ID_PASSWORD|MCP_ACCESS_TOKEN)[ \t]*=[ \t]*(.*)$"
+)
+
+
+def _populated_example_secret(data: str) -> bool:
+    for line in data.splitlines():
+        assignment = EXAMPLE_SECRET_ASSIGNMENT.match(line)
+        if assignment is None:
+            continue
+        value = assignment.group(1).strip()
+        if not value or value.startswith("#"):
+            continue
+        if value[0] in ("'", '"'):
+            quoted = re.fullmatch(r"(['\"])(.*?)\1[ \t]*(?:#.*)?", value)
+            if quoted is not None and not quoted.group(2).strip():
+                continue
+        return True
+    return False
 
 
 def main() -> int:
@@ -25,11 +44,16 @@ def main() -> int:
         if not value:
             continue
         path = Path(value)
-        if (path.name.lower() in FORBIDDEN_NAME or path.suffix.lower() in FORBIDDEN_EXT or
-                (path.name.startswith(".env.") and path.name != ".env.example")):
+        name = path.name.casefold()
+        if (name in FORBIDDEN_NAME or path.suffix.casefold() in FORBIDDEN_EXT or
+                (name.startswith(".env.") and name != ".env.example")):
             failures.append(f"forbidden tracked path: {value}")
             continue
-        if path.suffix.lower() in CONFIG_EXT and path.name != ".env.example":
+        if name == ".env.example":
+            data = (ROOT / path).read_text(encoding="utf-8", errors="replace")
+            if _populated_example_secret(data):
+                failures.append(f"possible plaintext secret in tracked config: {value}")
+        elif path.suffix.lower() in CONFIG_EXT:
             data = (ROOT / path).read_text(encoding="utf-8", errors="replace")
             if SECRET_ASSIGNMENT.search(data):
                 failures.append(f"possible plaintext secret in tracked config: {value}")
