@@ -15,11 +15,9 @@ jobs:
   enforce:
     name: heaven-autoupdate-enforce
     if: ${{ (github.event_name != 'pull_request' || (!github.event.pull_request.draft || contains(github.event.pull_request.body, 'Draft-CI-OptIn=true'))) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on:
-      - self-hosted
-      - Windows
-      - X64
-      - ${{ github.event_name == 'pull_request' && 'heaven-toolbox-isolated' || 'heaven-worker' }}
+    # This validates source metadata and file paths; it never runs the installer.
+    # Public PR code stays on an ephemeral hosted runner, outside private Heaven1.
+    runs-on: windows-latest
     timeout-minutes: 5
     steps:
       - name: Check out exact source
@@ -27,7 +25,7 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - name: Enforce automatic update contract (Heaven1 native Windows)
+      - name: Enforce automatic update source contract (hosted Windows)
         shell: powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"
         env:
           EXPECTED_REPOSITORY: ${{ github.repository }}
