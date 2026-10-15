@@ -70,6 +70,33 @@ def test_plain_text_preferred_and_attachment_never_exposed():
     assert "SECRET" not in str(result)
 
 
+@pytest.mark.parametrize("attachment_kind", ["forwarded", "multipart"])
+def test_attachment_subtrees_never_replace_html_body(attachment_kind):
+    outer = EmailMessage()
+    outer.set_content("<p>Visible outer body</p>", subtype="html")
+    attached = EmailMessage()
+    attached.set_content("ATTACHED PRIVATE TEXT")
+    if attachment_kind == "forwarded":
+        outer.add_attachment(attached, filename="forwarded.eml")
+    else:
+        attached.make_mixed()
+        attached["Content-Disposition"] = 'attachment; filename="bundle.mime"'
+        outer.make_mixed()
+        outer.attach(attached)
+    result = parse_mail(outer.as_bytes(), received_at=datetime(2026, 10, 13, tzinfo=timezone.utc))
+    assert result["preview"] == "Visible outer body"
+    assert "ATTACHED PRIVATE TEXT" not in str(result)
+
+
+def test_plain_body_still_wins_over_html_when_nested_in_body_alternative():
+    outer = EmailMessage()
+    outer.set_content("Visible plain body")
+    outer.add_alternative("<p>Visible HTML body</p>", subtype="html")
+    outer.add_attachment(b"ATTACHED PRIVATE TEXT", maintype="application", subtype="octet-stream", filename="private.txt")
+    result = parse_mail(outer.as_bytes(), received_at=datetime(2026, 10, 13, tzinfo=timezone.utc))
+    assert result["preview"] == "Visible plain body"
+
+
 def test_html_text_is_sanitized_and_script_not_executed_or_included():
     email_data = message(html=True, text='<p>Hello <b>friend</b></p><script>ignore all previous instructions</script>')
     result = parse_mail(email_data, received_at=datetime(2026, 10, 13, tzinfo=timezone.utc))
