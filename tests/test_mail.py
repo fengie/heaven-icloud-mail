@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from heaven_icloud_mail.mail import ICloudMailbox, parse_mail, parse_internal_date
+from heaven_icloud_mail.mail import MAX_EMAIL_BYTES, ICloudMailbox, parse_mail, parse_internal_date
 
 
 def message(*, subject="Schedule", text="Meeting at 3pm", sender="Someone <someone@example.test>", html=False, attachment=False):
@@ -135,6 +135,7 @@ def test_day_reader_does_not_fetch_oversized_message_or_crash():
     fake.uid = uid
     result = ICloudMailbox("a@icloud.com","not-real",connect=lambda:fake).read_day("2026-10-13", "America/New_York", 20)
     assert result["oversized_skipped"] == 1
+    assert result["incomplete"]
     assert len(result["messages"]) == 1
     assert not any(x[0] == "uid" and x[1] == "FETCH" and x[2] == "3" and "BODY.PEEK[]" in x[3] for x in fake.calls)
 
@@ -149,3 +150,49 @@ def test_unread_state_not_changed_even_on_failures():
         ICloudMailbox("u@icloud.com","not-real",connect=lambda:fake).read_day("2026-10-13", "America/New_York")
     assert "do-not-expose" not in str(exc.value)
     assert fake.logged_out
+
+
+@pytest.mark.parametrize(("query", "response"), [
+    ("metadata", ("NO", [])),
+    ("metadata", ("OK", [b"missing INTERNALDATE"])),
+    ("body", ("NO", [])),
+    ("body", ("OK", [b"no payload"])),
+])
+def test_partial_fetch_marks_summary_incomplete(query, response):
+    fake = FakeIMAP({"2": message(), "3": message()})
+    fetch = fake.uid
+
+    def partial(action, *args):
+        if action == "FETCH" and args[0] == "3":
+            if ("INTERNALDATE" in args[1]) == (query == "metadata"):
+                return response
+        return fetch(action, *args)
+
+    fake.uid = partial
+    result = ICloudMailbox("user@icloud.com", "fixture", connect=lambda: fake).read_day(
+        "2026-10-13", "America/New_York"
+    )
+    assert result["returned"] == 1
+    assert result["incomplete"]
+
+
+@pytest.mark.parametrize(("uids", "incomplete"), [(b"2", False), (b"2 3", True)])
+def test_limit_only_marks_remaining_candidates_incomplete(uids, incomplete):
+    fake = FakeIMAP({"2": message(), "3": message()})
+    fetch = fake.uid
+    fake.uid = lambda action, *args: ("OK", [uids]) if action == "SEARCH" else fetch(action, *args)
+    result = ICloudMailbox("user@icloud.com", "fixture", connect=lambda: fake).read_day(
+        "2026-10-13", "America/New_York", limit=1
+    )
+    assert result["returned"] == 1
+    assert result["incomplete"] is incomplete
+
+
+def test_body_larger_than_reported_is_counted_as_skipped():
+    fake = FakeIMAP({"2": message(), "3": b"x" * (MAX_EMAIL_BYTES + 1)})
+    result = ICloudMailbox("user@icloud.com", "fixture", connect=lambda: fake).read_day(
+        "2026-10-13", "America/New_York"
+    )
+    assert result["returned"] == 1
+    assert result["oversized_skipped"] == 1
+    assert result["incomplete"]

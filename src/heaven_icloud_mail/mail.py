@@ -164,15 +164,18 @@ class ICloudMailbox:
             selected = list(reversed(ids[-MAX_SCAN:]))
             messages: list[dict[str, object]] = []
             too_large = 0
-            for uid in selected:
+            incomplete = len(ids) > MAX_SCAN
+            for scanned, uid in enumerate(selected, start=1):
                 status, response = box.uid("FETCH", uid, "(INTERNALDATE RFC822.SIZE)")
                 if status != "OK":
+                    incomplete = True
                     continue
                 meta = _response_bytes(response)
                 try:
                     received = parse_internal_date(meta).astimezone(tz)
                     size = _size(meta)
                 except ValueError:
+                    incomplete = True
                     continue
                 if received.date() != requested:
                     continue
@@ -181,12 +184,18 @@ class ICloudMailbox:
                     continue
                 status, raw_response = box.uid("FETCH", uid, "(BODY.PEEK[])")
                 if status != "OK":
+                    incomplete = True
                     continue
                 data = next((item[1] for item in raw_response if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes)), None)
-                if data is None or len(data) > MAX_EMAIL_BYTES:
+                if data is None:
+                    incomplete = True
+                    continue
+                if len(data) > MAX_EMAIL_BYTES:
+                    too_large += 1
                     continue
                 messages.append(parse_mail(data, received_at=received))
                 if len(messages) >= limit:
+                    incomplete = incomplete or scanned < len(selected)
                     break
             return {
                 "day": requested.isoformat(),
@@ -194,7 +203,7 @@ class ICloudMailbox:
                 "messages": messages,
                 "returned": len(messages),
                 "oversized_skipped": too_large,
-                "incomplete": len(ids) > MAX_SCAN or len(messages) >= limit,
+                "incomplete": incomplete or too_large > 0,
                 "read_only": True,
             }
         except (imaplib.IMAP4.error, OSError, ValueError, AttributeError, TypeError) as exc:
