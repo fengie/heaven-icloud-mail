@@ -1,13 +1,13 @@
 """Tests are written first (RED); production implementation follows."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from heaven_icloud_mail.mail import MAX_EMAIL_BYTES, ICloudMailbox, parse_mail, parse_internal_date
+from heaven_icloud_mail.mail import MAX_EMAIL_BYTES, MAX_SCAN, ICloudMailbox, parse_mail, parse_internal_date
 
 
 def message(*, subject="Schedule", text="Meeting at 3pm", sender="Someone <someone@example.test>", html=False, attachment=False):
@@ -212,4 +212,37 @@ def test_missing_size_outside_the_day_does_not_make_the_summary_incomplete():
         "2026-10-13", "America/New_York"
     )
     assert result["returned"] == 2
+    assert not result["incomplete"]
+
+
+@pytest.mark.parametrize(("requested", "zone", "arrival"), [
+    ("2026-10-13", "Pacific/Kiritimati", "11-Oct-2026 22:30:00 -1200"),
+    ("2026-10-13", "Etc/GMT+12", "15-Oct-2026 01:30:00 +1400"),
+    ("2026-11-01", "America/New_York", "01-Nov-2026 05:30:00 +0000"),
+    ("2026-11-01", "America/New_York", "01-Nov-2026 06:30:00 +0000"),
+])
+def test_newer_unrelated_mail_cannot_displace_a_historical_day(requested, zone, arrival):
+    fake = FakeIMAP({"1": message(subject="Historical appointment")})
+    fetch = fake.uid
+    later = date(2026, 12, 1)
+    dates = [datetime.strptime(arrival, "%d-%b-%Y %H:%M:%S %z").date()] + [later] * MAX_SCAN
+
+    def search_or_fetch(action, *args):
+        if action == "SEARCH":
+            criteria = dict(zip(args[1::2], args[2::2]))
+            since = datetime.strptime(criteria["SINCE"], "%d-%b-%Y").date()
+            before = datetime.strptime(criteria.get("BEFORE", "31-Dec-9999"), "%d-%b-%Y").date()
+            matches = [str(i) for i, day in enumerate(dates, 1) if since <= day < before]
+            return "OK", [" ".join(matches).encode("ascii")]
+        uid, query = args
+        if "INTERNALDATE" in query:
+            when = arrival if uid == "1" else "01-Dec-2026 12:00:00 +0000"
+            return "OK", [f'(INTERNALDATE "{when}" RFC822.SIZE 500)'.encode()]
+        return fetch(action, *args)
+
+    fake.uid = search_or_fetch
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day(
+        requested, zone
+    )
+    assert [item["subject"] for item in result["messages"]] == ["Historical appointment"]
     assert not result["incomplete"]
