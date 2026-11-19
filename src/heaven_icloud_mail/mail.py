@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import email
 from email import policy
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from html.parser import HTMLParser
 import imaplib
 import re
@@ -152,10 +152,15 @@ class ICloudMailbox:
             status, _ = box.select("INBOX", readonly=True)
             if status != "OK":
                 raise ValueError("Inbox selection rejected")
-            # Search starts two calendar days early to account for server/user TZ offsets.
-            # Membership is determined by trusted IMAP INTERNALDATE, not the spoofable Date header.
-            since = (requested - timedelta(days=2)).strftime("%d-%b-%Y")
-            status, rows = box.uid("SEARCH", None, "SINCE", since)
+            # IMAP searches the server calendar date. Opposite UTC offsets can put
+            # that date two days either side of the user's day. BEFORE is exclusive.
+            ordinal = requested.toordinal()
+            since = date.fromordinal(max(1, ordinal - 2)).strftime("%d-%b-%Y")
+            criteria = ["SINCE", since]
+            if ordinal + 3 <= date.max.toordinal():
+                before = date.fromordinal(ordinal + 3).strftime("%d-%b-%Y")
+                criteria.extend(["BEFORE", before])
+            status, rows = box.uid("SEARCH", None, *criteria)
             if status != "OK" or not rows:
                 raise ValueError("Inbox search rejected")
             ids = rows[0].decode("ascii").split()
