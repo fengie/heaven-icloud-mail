@@ -173,11 +173,11 @@ class ICloudMailbox:
                 meta = _response_bytes(response)
                 try:
                     received = parse_internal_date(meta).astimezone(tz)
+                    if received.date() != requested:
+                        continue
                     size = _size(meta)
                 except ValueError:
                     incomplete = True
-                    continue
-                if received.date() != requested:
                     continue
                 if size > MAX_EMAIL_BYTES:
                     too_large += 1

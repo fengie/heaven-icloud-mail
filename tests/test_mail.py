@@ -196,3 +196,20 @@ def test_body_larger_than_reported_is_counted_as_skipped():
     assert result["returned"] == 1
     assert result["oversized_skipped"] == 1
     assert result["incomplete"]
+
+
+def test_missing_size_outside_the_day_does_not_make_the_summary_incomplete():
+    fake = FakeIMAP({"2": message(), "3": message()})
+    fetch = fake.uid
+
+    def without_old_size(action, *args):
+        if action == "FETCH" and args[0] == "1" and "INTERNALDATE" in args[1]:
+            return "OK", [b'1 (UID 1 INTERNALDATE "12-Oct-2026 20:30:00 -0400")']
+        return fetch(action, *args)
+
+    fake.uid = without_old_size
+    result = ICloudMailbox("user@icloud.com", "fixture", connect=lambda: fake).read_day(
+        "2026-10-13", "America/New_York"
+    )
+    assert result["returned"] == 2
+    assert not result["incomplete"]
