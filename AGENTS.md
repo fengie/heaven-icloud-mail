@@ -2,6 +2,12 @@
 
 This repository owns the standalone iCloud Mail product, its tests, releases, deployment proof and user-facing documentation. Reusable agent/runtime primitives stay in `fengie/heaven-toolbox`. Refresh the **current** `fengie/heaven-toolbox@main` (AGENTS.md, _AGENT_TRAINING/README.md, GLOBAL_GIT_DIRECTIVE.md, applicable policies) before substantive work. This text never substitutes for the live upstream training.
 
+For engineering tasks, set `$Toolbox` to the clean Toolbox checkout and `$ToolboxSourceSha` to the full parent commit verified at task start. Keep that revision in the existing task evidence and restore it on resume. Use a short engineering question without message contents, addresses or credentials. Set `$Task` to that question and run the shared lookup from this repository. Check any returned finding against this product’s source and tests.
+
+```powershell
+node (Join-Path $Toolbox 'tools/agent-control/research-preflight.mjs') --root $Toolbox --task $Task --scope fengie/heaven-icloud-mail --source-sha $ToolboxSourceSha
+```
+
 ## User mission
 - Mom uses the iPhone Apple Mail app with an `@icloud.com` address and ChatGPT Free. She should be able to ask naturally in Chinese to summarize her inbox without typing plugin names or creating Gmail/Microsoft accounts.
 - Build the smallest secure, read-only iCloud IMAP bridge first. Account owner's consent is required. Ask her to generate a **separate app-specific password** using Apple's supported process; never ask for her Apple Account main password.
