@@ -247,7 +247,7 @@ def test_newer_unrelated_mail_cannot_displace_a_historical_day(requested, zone, 
         uid, query = args
         if "INTERNALDATE" in query:
             when = arrival if uid == "1" else "01-Dec-2026 12:00:00 +0000"
-            return "OK", [f'(INTERNALDATE "{when}" RFC822.SIZE {len(fake.responses.get(uid, b""))})'.encode()]
+            return "OK", [f'1 (UID {uid} INTERNALDATE "{when}" RFC822.SIZE {len(fake.responses.get(uid, b""))})'.encode()]
         return fetch(action, *args)
 
     fake.uid = search_or_fetch
@@ -306,3 +306,94 @@ def test_zero_message_size_is_not_treated_as_complete():
     assert result["returned"] == 0
     assert result["incomplete"]
     assert not any(call[:2] == ("uid", "FETCH") and "BODY" in call[3] for call in fake.calls)
+
+@pytest.mark.parametrize("failure", ["other_uid", "missing_uid", "split_metadata", "duplicate_metadata"])
+def test_metadata_must_belong_to_the_requested_uid(failure):
+    fake = FakeIMAP({"2": message(subject="Valid"), "3": message(subject="Wrong")})
+    fetch = fake.uid
+    size = len(fake.responses["3"])
+    date_field = 'INTERNALDATE "13-Oct-2026 11:00:00 -0400"'
+    cases = {
+        "other_uid": [f"9 (UID 99 {date_field} RFC822.SIZE {size})".encode()],
+        "missing_uid": [f"9 (FLAGS (UID 3) {date_field} RFC822.SIZE {size})".encode()],
+        "split_metadata": [
+            f"9 (UID 99 {date_field})".encode(),
+            f"1 (UID 3 RFC822.SIZE {size})".encode(),
+        ],
+        "duplicate_metadata": [
+            f"1 (UID 3 {date_field} RFC822.SIZE {size})".encode(),
+            f"1 (UID 3 {date_field} RFC822.SIZE {size})".encode(),
+        ],
+    }
+
+    def wrong(action, *args):
+        if action == "FETCH" and args[0] == "3" and "INTERNALDATE" in args[1]:
+            return "OK", cases[failure]
+        return fetch(action, *args)
+
+    fake.uid = wrong
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert [item["subject"] for item in result["messages"]] == ["Valid"]
+    assert result["incomplete"]
+    assert not any(call[:3] == ("uid", "FETCH", "3") and "BODY" in call[3] for call in fake.calls)
+
+
+@pytest.mark.parametrize("failure", ["other_uid", "missing_uid", "wrong_origin", "wrong_literal_length", "duplicate_body"])
+def test_body_must_belong_to_the_requested_uid_and_partial_origin(failure):
+    fake = FakeIMAP({"2": message(subject="Valid"), "3": message(subject="Wrong")})
+    fetch = fake.uid
+    raw = fake.responses["3"]
+    size = len(raw)
+    def header(uid, offset=0, count=size):
+        return f"1 (UID {uid} BODY[]<{offset}> {{{count}}}".encode()
+    cases = {
+        "other_uid": [(header(99), raw), b")"],
+        "missing_uid": [(f"1 (BODY[]<0> {{{size}}}".encode(), raw), b")"],
+        "wrong_origin": [(header(3, offset=1), raw), b")"],
+        "wrong_literal_length": [(header(3, count=size+1), raw), b")"],
+        "duplicate_body": [(header(3), raw), b")", (header(3), raw), b")"],
+    }
+
+    def wrong(action, *args):
+        if action == "FETCH" and args[0] == "3" and "BODY" in args[1]:
+            return "OK", cases[failure]
+        return fetch(action, *args)
+
+    fake.uid = wrong
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert [item["subject"] for item in result["messages"]] == ["Valid"]
+    assert result["incomplete"]
+
+
+def test_unsolicited_fetch_data_and_uid_after_literal_are_handled_without_cross_binding():
+    fake = FakeIMAP({"3": message(subject="Right")})
+    raw = fake.responses["3"]
+    unrelated = message(subject="Wrong")
+    assert len(raw) == len(unrelated)
+    size = len(raw)
+    fetch = fake.uid
+
+    def mixed(action, *args):
+        if action == "SEARCH":
+            return "OK", [b"3"]
+        if action == "FETCH" and "INTERNALDATE" in args[1]:
+            return "OK", [
+                b'9 (UID 99 INTERNALDATE "12-Oct-2026 11:00:00 -0400" RFC822.SIZE 1)',
+                f'1 (FLAGS (\\Seen) INTERNALDATE "13-Oct-2026 11:00:00 -0400" RFC822.SIZE {size} UID 3)'.encode(),
+            ]
+        if action == "FETCH" and "BODY" in args[1]:
+            return "OK", [
+                (f"9 (UID 99 BODY[]<0> {{{size}}}".encode(), unrelated), b")",
+                (f"1 (BODY[]<0> {{{size}}}".encode(), raw), b" UID 3)",
+            ]
+        return fetch(action, *args)
+
+    fake.uid = mixed
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert [item["subject"] for item in result["messages"]] == ["Right"]
+    assert not result["incomplete"]
+
+
+def test_space_padded_internal_date_is_valid_imap():
+    parsed = parse_internal_date(b'5 (UID 11 INTERNALDATE " 1-Nov-2026 05:30:00 +0000" RFC822.SIZE 42)')
+    assert parsed.day == 1 and parsed.month == 11
