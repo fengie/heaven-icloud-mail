@@ -7,7 +7,7 @@
 ## What it does now
 
 - Retrieves a bounded set of emails received on a particular day from one `@icloud.com` inbox with Apple's secure IMAP server (`imap.mail.me.com:993`), using an Apple **app-specific password** supplied at runtime.
-- Restricts IMAP to readonly selection, UID SEARCH and UID FETCH with `BODY.PEEK[]`. Doesn't send, delete, edit, mark read, or download attachments to disk.
+- Restricts IMAP to readonly selection, UID SEARCH and bounded partial UID FETCH with `BODY.PEEK[]<0.262145>` (256 KiB plus one sentinel byte). Oversized or size-inconsistent message bodies are skipped and mark the result incomplete. Doesn't send, delete, edit, mark read, or download attachments to disk.
 - Uses the IMAP `INTERNALDATE` rather than a possibly forged email Date header; respects the configured timezone.
 - Returns only a short plain-text preview (up to 700 characters), sender, subject, time, and basic risk hints. The ChatGPT model, not this program, creates the Chinese-language summary.
 - No background sync, no database, and no persistence of message contents.
