@@ -21,7 +21,7 @@ MAX_EMAIL_BYTES = 262_144
 MAX_SCAN = 200
 MAX_PREVIEW = 700
 
-_DATE = re.compile(rb'INTERNALDATE\s+"(\d{1,2}-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2} [+-]\d{4})"', re.I)
+_DATE = re.compile(rb'INTERNALDATE\s+"((?: \d|\d{1,2})-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2} [+-]\d{4})"', re.I)
 _SIZE = re.compile(rb'RFC822\.SIZE\s+(\d+)', re.I)
 _RISK = re.compile(r"(?i)(ignore (?:all |your |the )?previous instructions|send (?:your |me )?(?:password|credentials)|verify (?:your )?account|urgent.{0,30}(?:payment|transfer)|验证码|账户异常|立即转账|密码)")
 
@@ -106,14 +106,102 @@ def parse_mail(raw: bytes, *, received_at: datetime) -> dict[str, object]:
     }
 
 
-def _response_bytes(items: object) -> bytes:
+# imaplib returns FETCH metadata as bytes, or a (header, literal)
+# tuple followed by the remainder of that same response. Recognize only
+# the attributes this read-only client uses, plus ordinary FLAGS.
+# In particular, UID inside FLAGS or a message literal is not a UID item.
+_MAX_FETCH_METADATA = 8192
+_FETCH_FRAME = re.compile(rb'[1-9][0-9]{0,9} \((.*)\)', re.I)
+_FETCH_FIELD = re.compile(
+    rb'(?:(?P<uid>UID [1-9][0-9]{0,9})'
+    rb'|(?P<date>INTERNALDATE "[^"\r\n]{1,40}")'
+    rb'|(?P<size>RFC822\.SIZE [0-9]{1,10})'
+    rb'|(?P<body>BODY\[\]<0> \{[0-9]{1,10}\})'
+    rb'|(?P<flags>FLAGS \([^()\r\n]*\)))',
+    re.I,
+)
+
+
+def _fetch_fields(frame: bytes) -> dict[str, bytes] | None:
+    if len(frame) > _MAX_FETCH_METADATA:
+        return None
+    envelope = _FETCH_FRAME.fullmatch(frame)
+    if envelope is None:
+        return None
+    payload = envelope.group(1)
+    fields: dict[str, bytes] = {}
+    cursor = 0
+    while cursor < len(payload):
+        field = _FETCH_FIELD.match(payload, cursor)
+        if field is None or field.lastgroup is None or field.lastgroup in fields:
+            return None
+        fields[field.lastgroup] = field.group()
+        cursor = field.end()
+        if cursor < len(payload):
+            if payload[cursor:cursor + 1] != b" ":
+                return None
+            cursor += 1
+            if cursor == len(payload):
+                return None
+    return fields
+
+
+def _fetch_frames(items: object):
     if not isinstance(items, (tuple, list)):
-        raise ValueError("Unrecognized IMAP response")
-    return b" ".join(
-        chunk if isinstance(chunk, bytes) else chunk[0]
-        for chunk in items
-        if isinstance(chunk, bytes) or (isinstance(chunk, tuple) and chunk and isinstance(chunk[0], bytes))
-    )
+        return
+    index = 0
+    while index < len(items):
+        part = items[index]
+        index += 1
+        data = None
+        if isinstance(part, bytes):
+            frame = part
+        elif (isinstance(part, tuple) and len(part) == 2 and
+              all(isinstance(value, bytes) for value in part)):
+            # UID can follow the literal. Do not concatenate a separate
+            # untagged FETCH response or scan the untrusted body as metadata.
+            if index >= len(items) or not isinstance(items[index], bytes):
+                continue
+            trailer = items[index]
+            if trailer != b")" and not trailer.startswith(b" "):
+                continue
+            index += 1
+            if len(part[0]) + len(trailer) > _MAX_FETCH_METADATA:
+                continue
+            frame, data = part[0] + trailer, part[1]
+        else:
+            continue
+        fields = _fetch_fields(frame)
+        if fields is not None:
+            yield fields, data
+
+
+def _has_uid(fields: dict[str, bytes], uid: str) -> bool:
+    value = fields.get("uid")
+    return value is not None and int(value.split()[1]) == int(uid)
+
+
+def _matching_metadata(items: object, uid: str) -> bytes | None:
+    matches = [
+        fields["date"] + b" " + fields.get("size", b"")
+        for fields, data in _fetch_frames(items)
+        if data is None and "body" not in fields and
+        _has_uid(fields, uid) and "date" in fields
+    ]
+    # Never assemble a date and size from different FETCH responses.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _matching_body(items: object, uid: str) -> bytes | None:
+    matches = []
+    for fields, data in _fetch_frames(items):
+        if data is None or not _has_uid(fields, uid) or "body" not in fields:
+            continue
+        declared = int(fields["body"].split(b"{", 1)[1][:-1])
+        if declared != len(data):
+            return None
+        matches.append(data)
+    return matches[0] if len(matches) == 1 else None
 
 
 def parse_internal_date(fetch_response: bytes) -> datetime:
@@ -175,7 +263,10 @@ class ICloudMailbox:
                 if status != "OK":
                     incomplete = True
                     continue
-                meta = _response_bytes(response)
+                meta = _matching_metadata(response, uid)
+                if meta is None:
+                    incomplete = True
+                    continue
                 try:
                     received = parse_internal_date(meta).astimezone(tz)
                     if received.date() != requested:
@@ -197,7 +288,7 @@ class ICloudMailbox:
                 if status != "OK":
                     incomplete = True
                     continue
-                data = next((item[1] for item in raw_response if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes)), None)
+                data = _matching_body(raw_response, uid)
                 if data is None:
                     incomplete = True
                     continue
