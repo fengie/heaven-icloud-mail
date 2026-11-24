@@ -1,7 +1,7 @@
 """Read a bounded snapshot from one iCloud inbox without changing message flags.
 
 Privacy invariant: mailbox commands are LOGIN, SELECT(readonly), UID SEARCH,
-UID FETCH using BODY.PEEK[], and LOGOUT only. No STORE, EXPUNGE, or SMTP.
+UID FETCH using bounded BODY.PEEK[] partial requests, and LOGOUT only. No STORE, EXPUNGE, or SMTP.
 """
 from __future__ import annotations
 
@@ -187,7 +187,13 @@ class ICloudMailbox:
                 if size > MAX_EMAIL_BYTES:
                     too_large += 1
                     continue
-                status, raw_response = box.uid("FETCH", uid, "(BODY.PEEK[])")
+                if size <= 0:
+                    incomplete = True
+                    continue
+                # RFC 3501/9051 partial BODY.PEEK is read-only and limits the
+                # requested octets on a compliant server. One sentinel byte
+                # detects a body above the quota even if size was underreported.
+                status, raw_response = box.uid("FETCH", uid, f"(BODY.PEEK[]<0.{MAX_EMAIL_BYTES + 1}>)")
                 if status != "OK":
                     incomplete = True
                     continue
@@ -197,6 +203,11 @@ class ICloudMailbox:
                     continue
                 if len(data) > MAX_EMAIL_BYTES:
                     too_large += 1
+                    continue
+                # A partial/mismatched response cannot establish a complete
+                # message. Do not summarize it as if all its MIME bytes arrived.
+                if len(data) != size:
+                    incomplete = True
                     continue
                 messages.append(parse_mail(data, received_at=received))
                 if len(messages) >= limit:
