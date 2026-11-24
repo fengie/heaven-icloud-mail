@@ -45,8 +45,10 @@ class FakeIMAP:
         uid, query = args
         if "INTERNALDATE" in query:
             when = {"1": "12-Oct-2026 20:30:00 -0400", "2": "13-Oct-2026 09:15:00 -0400", "3": "13-Oct-2026 11:00:00 -0400"}[uid]
-            return ("OK", [f'1 (UID {uid} INTERNALDATE "{when}" RFC822.SIZE 500)'.encode()])
-        return ("OK", [(f"1 (UID {uid} BODY[] {{{len(self.responses[uid])}}}".encode(), self.responses[uid]), b")"])
+            size = len(self.responses[uid]) if uid in self.responses else 500
+            return ("OK", [f'1 (UID {uid} INTERNALDATE "{when}" RFC822.SIZE {size})'.encode()])
+        section = "BODY[]<0>" if "<0." in query else "BODY[]"
+        return ("OK", [(f"1 (UID {uid} {section} {{{len(self.responses[uid])}}}".encode(), self.responses[uid]), b")"])
 
     def logout(self):
         self.logged_out = True
@@ -190,6 +192,14 @@ def test_limit_only_marks_remaining_candidates_incomplete(uids, incomplete):
 
 def test_body_larger_than_reported_is_counted_as_skipped():
     fake = FakeIMAP({"2": message(), "3": b"x" * (MAX_EMAIL_BYTES + 1)})
+    fetch = fake.uid
+
+    def underreported(action, *args):
+        if action == "FETCH" and args[0] == "3" and "INTERNALDATE" in args[1]:
+            return "OK", [b'1 (UID 3 INTERNALDATE "13-Oct-2026 11:00:00 -0400" RFC822.SIZE 500)']
+        return fetch(action, *args)
+
+    fake.uid = underreported
     result = ICloudMailbox("user@icloud.com", "fixture", connect=lambda: fake).read_day(
         "2026-10-13", "America/New_York"
     )
@@ -237,7 +247,7 @@ def test_newer_unrelated_mail_cannot_displace_a_historical_day(requested, zone, 
         uid, query = args
         if "INTERNALDATE" in query:
             when = arrival if uid == "1" else "01-Dec-2026 12:00:00 +0000"
-            return "OK", [f'(INTERNALDATE "{when}" RFC822.SIZE 500)'.encode()]
+            return "OK", [f'(INTERNALDATE "{when}" RFC822.SIZE {len(fake.responses.get(uid, b""))})'.encode()]
         return fetch(action, *args)
 
     fake.uid = search_or_fetch
@@ -246,3 +256,53 @@ def test_newer_unrelated_mail_cannot_displace_a_historical_day(requested, zone, 
     )
     assert [item["subject"] for item in result["messages"]] == ["Historical appointment"]
     assert not result["incomplete"]
+
+def test_body_fetch_requests_bounded_read_only_octets():
+    fake = FakeIMAP({"2": message(), "3": message()})
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    body_calls = [call for call in fake.calls if call[:2] == ("uid", "FETCH") and "BODY" in call[3]]
+    assert len(body_calls) == 2
+    assert all(call[3] == f"(BODY.PEEK[]<0.{MAX_EMAIL_BYTES + 1}>)" for call in body_calls)
+    assert result["returned"] == 2
+    assert result["read_only"] and not result["incomplete"]
+
+
+@pytest.mark.parametrize("reported_delta", [-1, 1])
+def test_inconsistent_body_length_is_not_summarized(reported_delta):
+    raw = message(subject="Inconsistent synthetic message")
+    fake = FakeIMAP({"2": message(subject="Valid"), "3": raw})
+    fetch = fake.uid
+
+    def mismatched(action, *args):
+        if action == "FETCH" and args[0] == "3" and "INTERNALDATE" in args[1]:
+            size = len(raw) + reported_delta
+            return "OK", [f'1 (UID 3 INTERNALDATE "13-Oct-2026 11:00:00 -0400" RFC822.SIZE {size})'.encode()]
+        return fetch(action, *args)
+
+    fake.uid = mismatched
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert [item["subject"] for item in result["messages"]] == ["Valid"]
+    assert result["incomplete"]
+    assert result["oversized_skipped"] == 0
+
+
+def test_exact_byte_limit_is_accepted_without_truncation():
+    raw = message(subject="Exact bound")
+    raw += b" " * (MAX_EMAIL_BYTES - len(raw))
+    fake = FakeIMAP({"3": raw})
+    fetch = fake.uid
+    fake.uid = lambda action, *args: ("OK", [b"3"]) if action == "SEARCH" else fetch(action, *args)
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert result["returned"] == 1
+    assert result["messages"][0]["subject"] == "Exact bound"
+    assert not result["incomplete"]
+
+
+def test_zero_message_size_is_not_treated_as_complete():
+    fake = FakeIMAP({"3": b""})
+    fetch = fake.uid
+    fake.uid = lambda action, *args: ("OK", [b"3"]) if action == "SEARCH" else fetch(action, *args)
+    result = ICloudMailbox("user@example.test", "fixture", connect=lambda: fake).read_day("2026-10-13")
+    assert result["returned"] == 0
+    assert result["incomplete"]
+    assert not any(call[:2] == ("uid", "FETCH") and "BODY" in call[3] for call in fake.calls)
