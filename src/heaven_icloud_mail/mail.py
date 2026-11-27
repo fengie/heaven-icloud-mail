@@ -49,10 +49,13 @@ class _VisibleHTML(HTMLParser):
             self.parts.append(data)
 
 
-def _flat(value: str, limit: int) -> str:
-    # Never return terminal control characters, even when present in untrusted headers.
-    return re.sub(r"\s+", " ", "".join(c for c in str(value) if c.isprintable() or c in "\t\n ")).strip()[:limit]
+def _normalized_text(value: str) -> str:
+    # Never return terminal control characters, even in untrusted headers.
+    return re.sub(r"\s+", " ", "".join(c for c in str(value) if c.isprintable() or c in "\t\n ")).strip()
 
+
+def _flat(value: str, limit: int) -> str:
+    return _normalized_text(value)[:limit]
 
 def _body_parts(message: email.message.EmailMessage):
     # walk() descends into attached messages and multipart attachments. Exclude
@@ -66,40 +69,69 @@ def _body_parts(message: email.message.EmailMessage):
         yield message
 
 
-def _text_preview(message: email.message.EmailMessage) -> str:
-    html_part = None
-    for part in _body_parts(message):
-        if part.get_content_type() not in ("text/plain", "text/html"):
-            continue
-        try:
-            content = part.get_content()
-        except (LookupError, UnicodeError, ValueError):
-            continue
-        if not isinstance(content, str):
-            continue
-        if part.get_content_type() == "text/plain":
-            return _flat(content, MAX_PREVIEW)
-        if html_part is None:
-            html_part = content
-    if html_part is not None:
-        parser = _VisibleHTML()
-        parser.feed(html_part)
-        parser.close()
-        return _flat("".join(parser.parts), MAX_PREVIEW)
-    return ""
+def _text_preview(message: email.message.EmailMessage) -> tuple[str, str, str | None]:
+    """Return bounded text, selected-representation coverage and source.
 
+    Complete means the selected normalized text fits, not that other MIME
+    representations, attachments, or the semantic meaning were assessed.
+    """
+    html_text = None
+    empty_source = None
+    decoding_failed = False
+
+    def covered(text: str, source: str) -> tuple[str, str, str]:
+        status = "truncated" if len(text) > MAX_PREVIEW else "complete"
+        return text[:MAX_PREVIEW], status, source
+
+    for part in _body_parts(message):
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+        source = "plain" if content_type == "text/plain" else "html"
+        try:
+            # The default content manager replaces invalid bytes silently.
+            # Reject an undecodable representation rather than assert coverage.
+            content = part.get_content(errors="strict")
+            if not isinstance(content, str) or part.defects:
+                decoding_failed = True
+                continue
+            if source == "html":
+                parser = _VisibleHTML()
+                parser.feed(content)
+                parser.close()
+                content = "".join(parser.parts)
+            normalized = _normalized_text(content)
+        except (LookupError, UnicodeError, ValueError):
+            decoding_failed = True
+            continue
+        if not normalized:
+            if empty_source is None or source == "plain":
+                empty_source = source
+            continue
+        if source == "plain":
+            return covered(normalized, source)
+        if html_text is None:
+            html_text = normalized
+
+    if html_text is not None:
+        return covered(html_text, "html")
+    if empty_source is not None and not decoding_failed:
+        return "", "empty", empty_source
+    return "", "unavailable", None
 
 def parse_mail(raw: bytes, *, received_at: datetime) -> dict[str, object]:
     """Parse only a safe, bounded preview; no attachments or active HTML."""
     message = email.message_from_bytes(raw, policy=policy.default)
     sender = _flat(str(message.get("From", "Unknown sender")), 160)
     subject = _flat(str(message.get("Subject", "(no subject)")), 200)
-    preview = _text_preview(message)
+    preview, preview_status, preview_source = _text_preview(message)
     risk = bool(_RISK.search(" ".join((subject, preview))))
     return {
         "sender": sender,
         "subject": subject,
         "preview": preview,
+        "preview_status": preview_status,
+        "preview_source": preview_source,
         "received_at": received_at.isoformat(timespec="seconds"),
         "potential_risk": risk,
         "untrusted": True,
