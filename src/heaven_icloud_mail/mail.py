@@ -24,6 +24,10 @@ MAX_PREVIEW = 700
 MAX_READ_SECONDS = 20.0
 MAX_IO_SECONDS = 15.0
 CLEANUP_SECONDS = 0.5
+# Allow up to 30 maximum-size returned messages and two extra literals.
+# A declared literal is charged before reading, even on a short read.
+MAX_SESSION_LITERAL_BYTES = (MAX_EMAIL_BYTES + 1) * 32
+MAX_SESSION_LITERALS = MAX_SCAN * 2
 
 _DATE = re.compile(rb'INTERNALDATE\s+"((?: \d|\d{1,2})-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2} [+-]\d{4})"', re.I)
 _SIZE = re.compile(rb'RFC822\.SIZE\s+(\d+)', re.I)
@@ -254,6 +258,34 @@ def _size(fetch_response: bytes) -> int:
     return int(match.group(1))
 
 
+class _TransportReadLimit(Exception):
+    """The declared literal exceeds the connection's read quota."""
+
+
+class _BoundedIMAP4SSL(imaplib.IMAP4_SSL):
+    """Cap literal allocations at the documented imaplib.read boundary.
+
+    This covers declared literal lengths, not all parser lines or total
+    process memory. Refusing a literal makes the stream unusable.
+    """
+    def __init__(self, *args, **kwargs):
+        self._literal_bytes = 0
+        self._literal_count = 0
+        self._literal_blocked = False
+        super().__init__(*args, **kwargs)
+
+    def read(self, size):
+        if (self._literal_blocked or type(size) is not int or size < 0 or
+                size > MAX_EMAIL_BYTES + 1 or
+                self._literal_bytes + size > MAX_SESSION_LITERAL_BYTES or
+                self._literal_count >= MAX_SESSION_LITERALS):
+            self._literal_blocked = True
+            raise _TransportReadLimit()
+        self._literal_bytes += size
+        self._literal_count += 1
+        return super().read(size)
+
+
 class _ReadDeadline(Exception):
     """No further foreground commands may start."""
 
@@ -275,7 +307,7 @@ class ICloudMailbox:
         self.username = username
         self._password = password
         self._clock = clock
-        self._connect = connect or (lambda: imaplib.IMAP4_SSL(
+        self._connect = connect or (lambda: _BoundedIMAP4SSL(
             MAIL_HOST, MAIL_PORT, ssl_context=ssl.create_default_context(), timeout=MAX_IO_SECONDS
         ))
 
@@ -307,16 +339,17 @@ class ICloudMailbox:
                 sock.settimeout(min(MAX_IO_SECONDS, left))
             return fn(*args, **kwargs)
 
-        def snapshot(*, expired=False, timed_out=False):
+        def snapshot(*, expired=False, timed_out=False, transport_limited=False):
             return {
                 "day": requested.isoformat(),
                 "timezone": timezone_name,
                 "messages": messages,
                 "returned": len(messages),
                 "oversized_skipped": too_large,
-                "incomplete": incomplete or too_large > 0 or expired or timed_out,
+                "incomplete": incomplete or too_large > 0 or expired or timed_out or transport_limited,
                 "deadline_exceeded": expired,
                 "read_timed_out": timed_out,
+                "transport_limited": transport_limited,
                 "read_only": True,
             }
 
@@ -392,6 +425,9 @@ class ICloudMailbox:
                     incomplete = incomplete or scanned < len(selected)
                     break
             return snapshot()
+        except _TransportReadLimit:
+            abort_stream = True
+            return snapshot(transport_limited=True)
         except _ReadDeadline:
             abort_stream = True
             return snapshot(expired=True)
@@ -412,5 +448,5 @@ class ICloudMailbox:
                         if sock is not None:
                             sock.settimeout(min(CLEANUP_SECONDS, left))
                         box.logout()
-                    except (OSError, imaplib.IMAP4.error, ValueError, AttributeError):
+                    except (OSError, imaplib.IMAP4.error, ValueError, AttributeError, _TransportReadLimit):
                         _close_connection(box)
