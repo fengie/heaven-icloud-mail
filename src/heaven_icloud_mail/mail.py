@@ -12,6 +12,7 @@ from html.parser import HTMLParser
 import imaplib
 import re
 import ssl
+import time
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,9 @@ MAIL_PORT = 993
 MAX_EMAIL_BYTES = 262_144
 MAX_SCAN = 200
 MAX_PREVIEW = 700
+MAX_READ_SECONDS = 20.0
+MAX_IO_SECONDS = 15.0
+CLEANUP_SECONDS = 0.5
 
 _DATE = re.compile(rb'INTERNALDATE\s+"((?: \d|\d{1,2})-[A-Za-z]{3}-\d{4} \d{2}:\d{2}:\d{2} [+-]\d{4})"', re.I)
 _SIZE = re.compile(rb'RFC822\.SIZE\s+(\d+)', re.I)
@@ -250,12 +254,29 @@ def _size(fetch_response: bytes) -> int:
     return int(match.group(1))
 
 
+class _ReadDeadline(Exception):
+    """No further foreground commands may start."""
+
+
+def _close_connection(box: object) -> None:
+    # Do not issue another protocol command on an expired or uncertain stream.
+    close = getattr(box, "shutdown", None)
+    if callable(close):
+        try:
+            close()
+        except (OSError, imaplib.IMAP4.error, ValueError, AttributeError):
+            pass
+
+
 class ICloudMailbox:
-    def __init__(self, username: str, password: str, *, connect: Callable[[], object] | None = None) -> None:
+    def __init__(self, username: str, password: str, *,
+                 connect: Callable[[], object] | None = None,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self.username = username
         self._password = password
+        self._clock = clock
         self._connect = connect or (lambda: imaplib.IMAP4_SSL(
-            MAIL_HOST, MAIL_PORT, ssl_context=ssl.create_default_context(), timeout=15
+            MAIL_HOST, MAIL_PORT, ssl_context=ssl.create_default_context(), timeout=MAX_IO_SECONDS
         ))
 
     def read_day(self, day: str, timezone_name: str = "America/New_York", limit: int = 20) -> dict[str, object]:
@@ -264,12 +285,48 @@ class ICloudMailbox:
         requested = date.fromisoformat(day)
         tz = ZoneInfo(timezone_name)
         box = None
+        messages: list[dict[str, object]] = []
+        too_large = 0
+        incomplete = False
+        abort_stream = False
+        deadline = self._clock() + MAX_READ_SECONDS
+
+        def remaining() -> float:
+            left = deadline - self._clock()
+            if left <= 0:
+                raise _ReadDeadline()
+            return left
+
+        def command(fn, *args, **kwargs):
+            # The socket timeout bounds idle I/O, not total elapsed time if
+            # a server keeps trickling bytes. The monotonic deadline governs
+            # whether any additional command may start.
+            left = remaining()
+            sock = getattr(box, "sock", None)
+            if sock is not None:
+                sock.settimeout(min(MAX_IO_SECONDS, left))
+            return fn(*args, **kwargs)
+
+        def snapshot(*, expired=False, timed_out=False):
+            return {
+                "day": requested.isoformat(),
+                "timezone": timezone_name,
+                "messages": messages,
+                "returned": len(messages),
+                "oversized_skipped": too_large,
+                "incomplete": incomplete or too_large > 0 or expired or timed_out,
+                "deadline_exceeded": expired,
+                "read_timed_out": timed_out,
+                "read_only": True,
+            }
+
         try:
+            remaining()
             box = self._connect()
-            status, _ = box.login(self.username, self._password)
+            status, _ = command(box.login, self.username, self._password)
             if status != "OK":
                 raise ValueError("Login rejected")
-            status, _ = box.select("INBOX", readonly=True)
+            status, _ = command(box.select, "INBOX", readonly=True)
             if status != "OK":
                 raise ValueError("Inbox selection rejected")
             # IMAP searches the server calendar date. Opposite UTC offsets can put
@@ -280,18 +337,16 @@ class ICloudMailbox:
             if ordinal + 3 <= date.max.toordinal():
                 before = date.fromordinal(ordinal + 3).strftime("%d-%b-%Y")
                 criteria.extend(["BEFORE", before])
-            status, rows = box.uid("SEARCH", None, *criteria)
+            status, rows = command(box.uid, "SEARCH", None, *criteria)
             if status != "OK" or not rows:
                 raise ValueError("Inbox search rejected")
             ids = rows[0].decode("ascii").split()
             if any(not x.isdecimal() or int(x) < 1 for x in ids):
                 raise ValueError("Invalid UID from server")
             selected = list(reversed(ids[-MAX_SCAN:]))
-            messages: list[dict[str, object]] = []
-            too_large = 0
             incomplete = len(ids) > MAX_SCAN
             for scanned, uid in enumerate(selected, start=1):
-                status, response = box.uid("FETCH", uid, "(INTERNALDATE RFC822.SIZE)")
+                status, response = command(box.uid, "FETCH", uid, "(INTERNALDATE RFC822.SIZE)")
                 if status != "OK":
                     incomplete = True
                     continue
@@ -316,7 +371,7 @@ class ICloudMailbox:
                 # RFC 3501/9051 partial BODY.PEEK is read-only and limits the
                 # requested octets on a compliant server. One sentinel byte
                 # detects a body above the quota even if size was underreported.
-                status, raw_response = box.uid("FETCH", uid, f"(BODY.PEEK[]<0.{MAX_EMAIL_BYTES + 1}>)")
+                status, raw_response = command(box.uid, "FETCH", uid, f"(BODY.PEEK[]<0.{MAX_EMAIL_BYTES + 1}>)")
                 if status != "OK":
                     incomplete = True
                     continue
@@ -336,21 +391,26 @@ class ICloudMailbox:
                 if len(messages) >= limit:
                     incomplete = incomplete or scanned < len(selected)
                     break
-            return {
-                "day": requested.isoformat(),
-                "timezone": timezone_name,
-                "messages": messages,
-                "returned": len(messages),
-                "oversized_skipped": too_large,
-                "incomplete": incomplete or too_large > 0,
-                "read_only": True,
-            }
-        except (imaplib.IMAP4.error, OSError, ValueError, AttributeError, TypeError) as exc:
+            return snapshot()
+        except _ReadDeadline:
+            abort_stream = True
+            return snapshot(expired=True)
+        except TimeoutError:
+            abort_stream = True
+            return snapshot(expired=self._clock() >= deadline, timed_out=True)
+        except (imaplib.IMAP4.error, OSError, ValueError, AttributeError, TypeError):
             # Do not leak provider errors, which can include account or mailbox details.
             raise RuntimeError("Unable to read iCloud Mail; check account consent, app-specific credentials, and connection") from None
         finally:
             if box is not None:
-                try:
-                    box.logout()
-                except (OSError, imaplib.IMAP4.error):
-                    pass
+                left = deadline - self._clock()
+                if abort_stream or left <= 0:
+                    _close_connection(box)
+                else:
+                    try:
+                        sock = getattr(box, "sock", None)
+                        if sock is not None:
+                            sock.settimeout(min(CLEANUP_SECONDS, left))
+                        box.logout()
+                    except (OSError, imaplib.IMAP4.error, ValueError, AttributeError):
+                        _close_connection(box)
